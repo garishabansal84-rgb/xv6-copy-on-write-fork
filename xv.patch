@@ -1,0 +1,657 @@
+diff --git a/Makefile b/Makefile
+index af1e7a5..74f05f8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -150,7 +150,10 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
+-
++	$U/_history\
++        $U/_whoami\
++	$U/_trace\
++        $U/_date
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+ 
+diff --git a/kernel/memlayout.h b/kernel/memlayout.h
+index 4f026ed..8b0fb15 100644
+--- a/kernel/memlayout.h
++++ b/kernel/memlayout.h
+@@ -19,6 +19,7 @@
+ 
+ // qemu puts UART registers here in physical memory.
+ #define UART0     0x10000000L
++#define RTC       0x00101000L
+ #define UART0_IRQ 10
+ 
+ // virtio mmio interface
+diff --git a/kernel/proc.c b/kernel/proc.c
+index f4c1668..45a82cb 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -25,7 +25,16 @@ extern char trampoline[]; // trampoline.S
+ // memory model when using p->parent.
+ // must be acquired before any p->lock.
+ struct spinlock wait_lock;
++int tracing_enabled = 0;
+ 
++void
++tracestate(struct proc *p, enum procstate oldstate, enum procstate newstate)
++{
++  if (tracing_enabled && oldstate != newstate) {
++    printk("pid %d (%s): %d -> %d\n",
++           p->pid, p->name, oldstate, newstate);
++  }
++}
+ // Allocate a page for each process's kernel stack.
+ // Map it high in memory, followed by an invalid
+ // guard page.
+@@ -102,53 +111,66 @@ allocpid()
+   return pid;
+ }
+ 
+-// Look in the process table for an UNUSED proc.
+-// If found, initialize state required to run in the kernel,
+-// and return with p->lock held.
+-// If there are no free procs, or a memory allocation fails, return 0.
+-static struct proc *
++static struct proc*
+ allocproc(void)
+ {
+   struct proc *p;
+ 
++  // Search the process table for an UNUSED slot.
++  // Each entry represents one possible process.
+   for (p = proc; p < &proc[NPROC]; p++) {
+     acquire(&p->lock);
++
++    // Found an available process-table entry.
+     if (p->state == UNUSED) {
+       goto found;
+     } else {
++      // This slot is already being used, so check the next one.
+       release(&p->lock);
+     }
+   }
++
++  // No unused process-table entry was available.
+   return 0;
+ 
+ found:
++  // Allocate a PID for the new process.
+   p->pid = allocpid();
++
++  // Mark the process-table slot as allocated.
++  // Older xv6 versions used the EMBRYO state here;
++  // this xv6-riscv version uses USED.
+   p->state = USED;
+ 
+-  // Allocate a trapframe page.
++  // Allocate a trapframe where the process's user registers
++  // will be saved when it enters the kernel.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+     freeproc(p);
+     release(&p->lock);
+     return 0;
+   }
+ 
+-  // An empty user page table.
++  // Create the process's page table and kernel mappings.
+   p->pagetable = proc_pagetable(p);
++
+   if (p->pagetable == 0) {
+     freeproc(p);
+     release(&p->lock);
+     return 0;
+   }
+ 
+-  // Set up new context to start executing at forkret,
+-  // which returns to user space.
++  // Initialize the saved kernel context.
+   memset(&p->context, 0, sizeof(p->context));
++
++  // The first time the scheduler switches to this process,
++  // execution begins at forkret().
+   p->context.ra = (uint64)forkret;
++
++  // Start the process with the top of its kernel stack.
+   p->context.sp = p->kstack + PGSIZE;
+ 
+   return p;
+ }
+-
+ // free a proc structure and the data hanging from it,
+ // including user pages.
+ // p->lock must be held.
+@@ -225,6 +247,7 @@ userinit(void)
+ 
+   p->cwd = namei("/");
+ 
++  tracestate(p, p->state, RUNNABLE);
+   p->state = RUNNABLE;
+ 
+   release(&p->lock);
+@@ -298,9 +321,13 @@ kfork(void)
+   release(&wait_lock);
+ 
+   acquire(&np->lock);
++  tracestate(np, np->state, RUNNABLE);
+   np->state = RUNNABLE;
+   release(&np->lock);
+ 
++  acquire(&p->lock);
++  p->forkcount++;
++  release(&p->lock);
+   return pid;
+ }
+ 
+@@ -355,6 +382,7 @@ kexit(int status)
+   acquire(&p->lock);
+ 
+   p->xstate = status;
++  tracestate(p, p->state, ZOMBIE);
+   p->state = ZOMBIE;
+ 
+   release(&wait_lock);
+@@ -448,6 +476,7 @@ scheduler(void)
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
++        tracestate(p, p->state, RUNNING);
+         p->state = RUNNING;
+         c->proc = p;
+         swtch(&c->context, &p->context);
+@@ -502,6 +531,7 @@ yield(void)
+ {
+   struct proc *p = myproc();
+   acquire(&p->lock);
++  tracestate(p, p->state, RUNNABLE);
+   p->state = RUNNABLE;
+   sched();
+   release(&p->lock);
+@@ -566,6 +596,7 @@ sleep(void)
+ 
+   acquire(&p->lock);
+   if (p->chan != 0) {
++    tracestate(p, p->state, SLEEPING);
+     p->state = SLEEPING;
+     sched();
+   }
+@@ -588,7 +619,8 @@ wakeup(void *chan)
+       // If this waiting process has gotten so far as to actually
+       // go to sleep, also set it back to RUNNING.
+       if (p->state == SLEEPING) {
+-        p->state = RUNNABLE;
++       tracestate(p, p->state, RUNNABLE);
++       p->state = RUNNABLE;
+       }
+     }
+     release(&p->lock);
+@@ -609,6 +641,7 @@ kkill(int pid)
+       p->killed = 1;
+       if (p->state == SLEEPING) {
+         // Wake process from sleep().
++        tracestate(p, p->state, RUNNABLE);
+         p->state = RUNNABLE;
+       }
+       release(&p->lock);
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 5603697..0dc9cc6 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -88,7 +88,7 @@ struct proc {
+   int killed;           // If non-zero, have been killed
+   int xstate;           // Exit status to be returned to parent's wait
+   int pid;              // Process ID
+-
++  int forkcount;
+   // wait_lock must be held when using this:
+   struct proc *parent; // Parent process
+ 
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..0759745 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,7 +103,12 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
+-
++extern uint64 sys_history(void);
++extern uint64 sys_date(void);
++extern uint64 sys_history_add(void);
++extern uint64 sys_getforkcount(void);
++extern uint64 sys_getancestors(void);
++extern uint64 sys_trace(void);
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+ static uint64 (*syscalls[])(void) = {
+@@ -130,7 +135,14 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   = sys_mkdir,
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_date]    = sys_date,
++  [SYS_history] = sys_history,
++  [SYS_history_add] = sys_history_add,
++  [SYS_getforkcount] sys_getforkcount,
++  [SYS_getancestors] sys_getancestors,
++  [SYS_trace] = sys_trace,
+   // clang-format on
++
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..871cd6e 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,9 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_date   23
++#define SYS_history 24
++#define SYS_history_add 25
++#define SYS_getforkcount 26
++#define SYS_getancestors 27
++#define SYS_trace 28
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..8fc0b82 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,8 +5,260 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "printf.h"
+ #include "vm.h"
++#define RTC_TIME_LOW   0x00
++#define RTC_TIME_HIGH  0x04
++#define MAX_HISTORY 20
++#define MAX_CMD 100
++extern struct spinlock wait_lock;
++extern struct proc *initproc;
++struct history_entry {
++  char command[MAX_CMD];
++};
++
++struct history_entry history_buffer[MAX_HISTORY];
++int history_count = 0;
++void
++add_history(char *cmd)
++{
++  int i;
++
++  if(history_count < MAX_HISTORY){
++    for(i = 0; i < MAX_CMD - 1 && cmd[i] != '\0'; i++)
++      history_buffer[history_count].command[i] = cmd[i];
++
++    history_buffer[history_count].command[i] = '\0';
++
++    history_count++;
++  }
++  else{
++    for(i = 1; i < MAX_HISTORY; i++)
++      history_buffer[i - 1] = history_buffer[i];
++
++    for(i = 0; i < MAX_CMD - 1 && cmd[i] != '\0'; i++)
++      history_buffer[MAX_HISTORY - 1].command[i] = cmd[i];
++
++    history_buffer[MAX_HISTORY - 1].command[i] = '\0';
++  }
++}
++uint64
++sys_history_add(void)
++{
++  uint64 addr;
++  char cmd[MAX_CMD];
++
++  argaddr(0, &addr);
++
++  if (copyin(myproc()->pagetable,
++           myproc()->sz,
++           cmd,
++           addr,
++           MAX_CMD) < 0)
++    return -1;
++
++  cmd[MAX_CMD - 1] = '\0';
++
++  add_history(cmd);
++
++  return 0;
++}
++uint64
++sys_history(void)
++{
++  uint64 addr;
++  int i;
++  int offset = 0;
++
++  argaddr(0, &addr);
++
++  for(i = 0; i < history_count; i++){
++    char line[MAX_CMD];
++
++    // Create: "1  ls\n"
++    int n = 0;
++    int num = i + 1;
++
++    if(num >= 10){
++      line[n++] = '0' + (num / 10);
++      line[n++] = '0' + (num % 10);
++    }
++    else{
++      line[n++] = '0' + num;
++    }
++
++    line[n++] = ' ';
++    line[n++] = ' ';
++
++    int j;
++    for(j = 0; j < MAX_CMD - n - 2 &&
++              history_buffer[i].command[j] != '\0'; j++)
++      line[n++] = history_buffer[i].command[j];
++
++    line[n++] = '\n';
++    line[n] = '\0';
++
++    if(copyout(myproc()->pagetable,
++               myproc()->sz,
++               addr + offset,
++               line,
++               n) < 0)
++      return -1;
++
++    offset += n;
++  }
++
++  return offset;
++}
++
++uint64
++sys_getancestors(void)
++{
++  struct proc *p = myproc();
++  uint64 addr;
++  int max;
++  int count = 0;
++  struct proc *cur;
++  int pid;
++
++  argaddr(0, &addr);
++  argint(1, &max);
++
++  if (max < 0)
++    return -1;
++
++  acquire(&wait_lock);
++
++  cur = p->parent;
++
++  while (cur != 0 && cur != initproc && count < max) {
++    pid = cur->pid;
++
++    if (copyout(p->pagetable,
++                p->sz,
++                addr + count * sizeof(int),
++                (char *)&pid,
++                sizeof(int)) < 0) {
++      release(&wait_lock);
++      return -1;
++    }
++
++    count++;
++    cur = cur->parent;
++  }
++
++  release(&wait_lock);
++
++  return count;
++}
++struct rtcdate {
++  int second;
++  int minute;
++  int hour;
++  int day;
++  int month;
++  int year;
++};
++
++static uint64
++rtc_read(void)
++{
++  volatile uint32 *low;
++  volatile uint32 *high;
++  uint32 lo, hi;
++
++  low = (volatile uint32 *)(RTC + RTC_TIME_LOW);
++  high = (volatile uint32 *)(RTC + RTC_TIME_HIGH);
++
++  lo = *low;
++  hi = *high;
++
++  return ((uint64)hi << 32) | lo;
++}
++
++static int
++isleap(int year)
++{
++  return (year % 4 == 0 && year % 100 != 0) ||
++         (year % 400 == 0);
++}
++
++uint64
++sys_getforkcount(void)
++{
++  struct proc *p = myproc();
++  int count;
++
++  acquire(&p->lock);
++  count = p->forkcount;
++  release(&p->lock);
++
++  return count;
++}
+ 
++uint64
++sys_date(void)
++{
++  struct rtcdate r;
++  uint64 ns;
++  uint64 seconds;
++  uint64 days;
++  int days_in_month[] = {
++    31, 28, 31, 30, 31, 30,
++    31, 31, 30, 31, 30, 31
++  };
++
++  uint64 addr;
++
++  argaddr(0, &addr);
++
++  /*
++   * RTC gives nanoseconds since January 1, 1970 UTC.
++   */
++  ns = rtc_read();
++  seconds = ns / 1000000000ULL;
++  seconds += 19800; 
++  r.second = seconds % 60;
++  seconds /= 60;
++
++  r.minute = seconds % 60;
++  seconds /= 60;
++
++  r.hour = seconds % 24;
++  days = seconds / 24;
++
++  /*
++   * Convert number of days since 1970-01-01
++   * into year/month/day.
++   */
++  r.year = 1970;
++
++  while (days >= (uint64)(isleap(r.year) ? 366 : 365)) {
++    days -= isleap(r.year) ? 366 : 365;
++    r.year++;
++  }
++
++  r.month = 1;
++
++  if (isleap(r.year))
++    days_in_month[1] = 29;
++
++  while (days >= (uint64)days_in_month[r.month - 1]) {
++    days -= days_in_month[r.month - 1];
++    r.month++;
++  }
++
++  r.day = days + 1;
++
++  if (copyout(myproc()->pagetable,
++            myproc()->sz,
++            addr,
++            (char *)&r,
++            sizeof(r)) < 0)
++  return -1;
++
++  return 0;
++}
+ uint64
+ sys_exit(void)
+ {
+@@ -110,3 +362,15 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++extern int tracing_enabled;
++
++uint64
++sys_trace(void)
++{
++  int on;
++
++  argint(0, &on);
++  tracing_enabled = on;
++
++  return 0;
++}
+diff --git a/kernel/vm.c b/kernel/vm.c
+index f50650b..466f661 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -29,6 +29,10 @@ kvmmake(void)
+   // uart registers
+   kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+ 
++
++  // RTC
++  kvmmap(kpgtbl, RTC, RTC, PGSIZE, PTE_R | PTE_W);
++  
+   // virtio mmio disk interface
+   kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+ 
+diff --git a/user/sh.c b/user/sh.c
+index 507ce42..3a02a17 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -157,26 +157,35 @@ main(void)
+   }
+ 
+   // Read and run input commands.
+-  while (getcmd(buf, sizeof(buf)) >= 0) {
+-    char *cmd = buf;
+-    while (*cmd == ' ' || *cmd == '\t')
+-      cmd++;
+-    if (*cmd == '\n') // is a blank command
+-      continue;
+-    if (cmd[0] == 'c' && cmd[1] == 'd' && cmd[2] == ' ') {
+-      // Chdir must be called by the parent, not the child.
+-      cmd[strlen(cmd) - 1] = 0; // chop \n
+-      if (chdir(cmd + 3) < 0)
+-        fprintf(2, "cannot cd %s\n", cmd + 3);
+-    } else {
+-      if (fork1() == 0)
+-        runcmd(parsecmd(cmd));
+-      wait(0);
+-    }
++while (getcmd(buf, sizeof(buf)) >= 0) {
++  char *cmd = buf;
++
++  while (*cmd == ' ' || *cmd == '\t')
++    cmd++;
++
++  if (*cmd == '\n')
++    continue;
++
++  // Remove the newline from the command
++  if (cmd[strlen(cmd) - 1] == '\n')
++    cmd[strlen(cmd) - 1] = '\0';
++
++  // Don't add the history command itself
++  if (strcmp(cmd, "history") != 0)
++    history_add(cmd);
++
++  if (cmd[0] == 'c' && cmd[1] == 'd' && cmd[2] == ' ') {
++    // Chdir must be called by the parent, not the child.
++    if (chdir(cmd + 3) < 0)
++      fprintf(2, "cannot cd %s\n", cmd + 3);
++  } else {
++    if (fork1() == 0)
++      runcmd(parsecmd(cmd));
++    wait(0);
++   }
+   }
+-  exit(0);
++ exit(0);
+ }
+-
+ void
+ panic(char *s)
+ {
+diff --git a/user/user.h b/user/user.h
+index 29aad59..9f49818 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,7 +25,9 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
+-
++int getforkcount(void);
++int getancestors(int *pids, int max);
++int trace(int);
+ // ulib.c
+ int stat(const char *, struct stat *);
+ char *strcpy(char *, const char *);
+@@ -48,3 +50,15 @@ void printf(const char *, ...) __attribute__((format(printf, 1, 2)));
+ // umalloc.c
+ void *malloc(uint);
+ void free(void *);
++struct rtcdate {
++  int second;
++  int minute;
++  int hour;
++  int day;
++  int month;
++  int year;
++};
++
++int date(struct rtcdate *);
++int history(char *);
++int history_add(char *);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..7c5c8b4 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,9 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("date");
++entry("history");
++entry("history_add");
++entry("getforkcount");
++entry("getancestors");
++entry("trace");

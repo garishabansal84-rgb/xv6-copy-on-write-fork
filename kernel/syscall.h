@@ -21,3 +21,11 @@
 #define SYS_mkdir  20
 #define SYS_close  21
 #define SYS_sync   22
+#define SYS_date   23
+#define SYS_history 24
+#define SYS_history_add 25
+#define SYS_getforkcount 26
+#define SYS_getancestors 27
+#define SYS_trace 28
+#define SYS_cowstats 29
+#define SYS_freemem 30

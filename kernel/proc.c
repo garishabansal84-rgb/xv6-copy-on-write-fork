@@ -25,7 +25,16 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+int tracing_enabled = 0;
 
+void
+tracestate(struct proc *p, enum procstate oldstate, enum procstate newstate)
+{
+  if (tracing_enabled && oldstate != newstate) {
+    printk("pid %d (%s): %d -> %d\n",
+           p->pid, p->name, oldstate, newstate);
+  }
+}
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -102,53 +111,68 @@ allocpid()
   return pid;
 }
 
-// Look in the process table for an UNUSED proc.
-// If found, initialize state required to run in the kernel,
-// and return with p->lock held.
-// If there are no free procs, or a memory allocation fails, return 0.
-static struct proc *
+static struct proc*
 allocproc(void)
 {
   struct proc *p;
 
+  // Search the process table for an UNUSED slot.
+  // Each entry represents one possible process.
   for (p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
+
+    // Found an available process-table entry.
     if (p->state == UNUSED) {
       goto found;
     } else {
+      // This slot is already being used, so check the next one.
       release(&p->lock);
     }
   }
+
+  // No unused process-table entry was available.
   return 0;
 
 found:
+  // Allocate a PID for the new process.
   p->pid = allocpid();
+  p->cow_faults = 0;
+  p->cow_copies = 0;
+
+  // Mark the process-table slot as allocated.
+  // Older xv6 versions used the EMBRYO state here;
+  // this xv6-riscv version uses USED.
   p->state = USED;
 
-  // Allocate a trapframe page.
+  // Allocate a trapframe where the process's user registers
+  // will be saved when it enters the kernel.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // An empty user page table.
+  // Create the process's page table and kernel mappings.
   p->pagetable = proc_pagetable(p);
+
   if (p->pagetable == 0) {
     freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
+  // Initialize the saved kernel context.
   memset(&p->context, 0, sizeof(p->context));
+
+  // The first time the scheduler switches to this process,
+  // execution begins at forkret().
   p->context.ra = (uint64)forkret;
+
+  // Start the process with the top of its kernel stack.
   p->context.sp = p->kstack + PGSIZE;
 
   return p;
 }
-
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -225,6 +249,7 @@ userinit(void)
 
   p->cwd = namei("/");
 
+  tracestate(p, p->state, RUNNABLE);
   p->state = RUNNABLE;
 
   release(&p->lock);
@@ -298,9 +323,13 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  tracestate(np, np->state, RUNNABLE);
   np->state = RUNNABLE;
   release(&np->lock);
 
+  acquire(&p->lock);
+  p->forkcount++;
+  release(&p->lock);
   return pid;
 }
 
@@ -355,6 +384,7 @@ kexit(int status)
   acquire(&p->lock);
 
   p->xstate = status;
+  tracestate(p, p->state, ZOMBIE);
   p->state = ZOMBIE;
 
   release(&wait_lock);
@@ -448,6 +478,7 @@ scheduler(void)
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
+        tracestate(p, p->state, RUNNING);
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
@@ -502,6 +533,7 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
+  tracestate(p, p->state, RUNNABLE);
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
@@ -566,6 +598,7 @@ sleep(void)
 
   acquire(&p->lock);
   if (p->chan != 0) {
+    tracestate(p, p->state, SLEEPING);
     p->state = SLEEPING;
     sched();
   }
@@ -588,7 +621,8 @@ wakeup(void *chan)
       // If this waiting process has gotten so far as to actually
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
-        p->state = RUNNABLE;
+       tracestate(p, p->state, RUNNABLE);
+       p->state = RUNNABLE;
       }
     }
     release(&p->lock);
@@ -609,6 +643,7 @@ kkill(int pid)
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
+        tracestate(p, p->state, RUNNABLE);
         p->state = RUNNABLE;
       }
       release(&p->lock);
@@ -698,4 +733,36 @@ procdump(void)
     printk("%d %s %s", p->pid, state, p->name);
     printk("\n");
   }
+}
+struct proc*
+getproc(int pid)
+{
+    struct proc *p;
+
+    for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+
+        if(p->pid == pid)
+            return p;
+
+        release(&p->lock);
+    }
+
+    return 0;
+}
+struct proc*
+findproc(int pid)
+{
+    struct proc *p;
+
+    for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+
+        if(p->pid == pid)
+            return p;
+
+        release(&p->lock);
+    }
+
+    return 0;
 }

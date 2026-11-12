@@ -157,26 +157,35 @@ main(void)
   }
 
   // Read and run input commands.
-  while (getcmd(buf, sizeof(buf)) >= 0) {
-    char *cmd = buf;
-    while (*cmd == ' ' || *cmd == '\t')
-      cmd++;
-    if (*cmd == '\n') // is a blank command
-      continue;
-    if (cmd[0] == 'c' && cmd[1] == 'd' && cmd[2] == ' ') {
-      // Chdir must be called by the parent, not the child.
-      cmd[strlen(cmd) - 1] = 0; // chop \n
-      if (chdir(cmd + 3) < 0)
-        fprintf(2, "cannot cd %s\n", cmd + 3);
-    } else {
-      if (fork1() == 0)
-        runcmd(parsecmd(cmd));
-      wait(0);
-    }
-  }
-  exit(0);
-}
+while (getcmd(buf, sizeof(buf)) >= 0) {
+  char *cmd = buf;
 
+  while (*cmd == ' ' || *cmd == '\t')
+    cmd++;
+
+  if (*cmd == '\n')
+    continue;
+
+  // Remove the newline from the command
+  if (cmd[strlen(cmd) - 1] == '\n')
+    cmd[strlen(cmd) - 1] = '\0';
+
+  // Don't add the history command itself
+  if (strcmp(cmd, "history") != 0)
+    history_add(cmd);
+
+  if (cmd[0] == 'c' && cmd[1] == 'd' && cmd[2] == ' ') {
+    // Chdir must be called by the parent, not the child.
+    if (chdir(cmd + 3) < 0)
+      fprintf(2, "cannot cd %s\n", cmd + 3);
+  } else {
+    if (fork1() == 0)
+      runcmd(parsecmd(cmd));
+    wait(0);
+   }
+  }
+ exit(0);
+}
 void
 panic(char *s)
 {

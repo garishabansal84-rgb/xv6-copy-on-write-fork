@@ -150,7 +150,13 @@ UPROGS=\
 	$U/_forphan\
 	$U/_dorphan\
 	$U/_sync\
-
+	$U/_history\
+    $U/_whoami\
+	$U/_trace\
+	$U/_cowtest\
+	$U/_memtest\
+    $U/_date
+		
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
 

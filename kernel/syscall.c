@@ -103,7 +103,14 @@ extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
 extern uint64 sys_sync(void);
-
+extern uint64 sys_history(void);
+extern uint64 sys_date(void);
+extern uint64 sys_history_add(void);
+extern uint64 sys_getforkcount(void);
+extern uint64 sys_getancestors(void);
+extern uint64 sys_trace(void);
+extern uint64 sys_cowstats(void);
+extern uint64 sys_freemem(void);
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
 static uint64 (*syscalls[])(void) = {
@@ -130,7 +137,16 @@ static uint64 (*syscalls[])(void) = {
   [SYS_mkdir]   = sys_mkdir,
   [SYS_close]   = sys_close,
   [SYS_sync]    = sys_sync,
+  [SYS_date]    = sys_date,
+  [SYS_history] = sys_history,
+  [SYS_history_add] = sys_history_add,
+  [SYS_getforkcount] sys_getforkcount,
+  [SYS_getancestors] sys_getancestors,
+  [SYS_trace] = sys_trace,
+  [SYS_cowstats] sys_cowstats,
+  [SYS_freemem] sys_freemem,
   // clang-format on
+
 };
 
 void

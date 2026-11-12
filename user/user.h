@@ -25,7 +25,9 @@ char *sys_sbrk(int, int);
 int pause(int);
 int uptime(void);
 int sync(void);
-
+int getforkcount(int pid);
+int getancestors(int pid,int *pids, int max);
+int trace(int);
 // ulib.c
 int stat(const char *, struct stat *);
 char *strcpy(char *, const char *);
@@ -48,3 +50,17 @@ void printf(const char *, ...) __attribute__((format(printf, 1, 2)));
 // umalloc.c
 void *malloc(uint);
 void free(void *);
+struct rtcdate {
+  int second;
+  int minute;
+  int hour;
+  int day;
+  int month;
+  int year;
+};
+
+int date(struct rtcdate *);
+int history(char *);
+int history_add(char *);
+int cowstats(int*, int*);
+uint64 freemem(void);

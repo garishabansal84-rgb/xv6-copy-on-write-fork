@@ -29,6 +29,10 @@ kvmmake(void)
   // uart registers
   kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
 
+
+  // RTC
+  kvmmap(kpgtbl, RTC, RTC, PGSIZE, PTE_R | PTE_W);
+  
   // virtio mmio disk interface
   kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
 
@@ -295,35 +299,48 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for (i = 0; i < sz; i += PGSIZE) {
     if ((pte = walk(old, i, 0)) == 0)
-      continue; // page table entry hasn't been allocated
+      continue;
+
     if ((*pte & PTE_V) == 0)
-      continue; // physical page hasn't been allocated
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if ((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char *)pa, PGSIZE);
-    if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0) {
-      kfree(mem);
+
+    // Only originally writable pages become COW.
+    if (flags & PTE_W) {
+      flags = (flags & ~PTE_W) | PTE_COW;
+    }
+
+    // Share the physical page with the child.
+    krefinc(pa);
+
+    if (mappages(new, i, PGSIZE, pa, flags) != 0) {
+      kfree((void *)pa);
       goto err;
     }
+
+    // Remove write permission from the parent's mapping too.
+    *pte = PA2PTE(pa) | flags;
   }
+  sfence_vma();
   return 0;
 
 err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
+
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -341,6 +358,7 @@ uvmclear(pagetable_t pagetable, uint64 va)
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
+
 int
 copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
 {
@@ -349,32 +367,45 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
 
   while (len > 0) {
     va0 = PGROUNDDOWN(dstva);
+
     if (va0 >= MAXVA)
       return -1;
 
     pa0 = walkaddr(pagetable, va0);
+
     if (pa0 == 0) {
-      if ((pa0 = vmfault(pagetable, psz, va0, 0)) == 0) {
+      if ((pa0 = vmfault(pagetable, psz, va0, 0)) == 0)
         return -1;
-      }
     }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
-    if ((*pte & PTE_W) == 0)
+
+    // Handle COW pages before writing into user memory.
+    if (*pte & PTE_COW) {
+      pa0 = cowalloc(pagetable, va0);
+
+      if (pa0 == 0)
+        return -1;
+    } else if ((*pte & PTE_W) == 0) {
+      // Do not allow writing to read-only pages.
       return -1;
+    }
 
     n = PGSIZE - (dstva - va0);
+
     if (n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
   }
+
   return 0;
 }
+
 
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.
@@ -476,6 +507,56 @@ vmfault(pagetable_t pagetable, uint64 psz, uint64 va, int read)
   }
   return mem;
 }
+
+uint64
+cowalloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa, mem;
+  uint flags;
+
+  va = PGROUNDDOWN(va);
+
+  if (va >= MAXVA)
+    return 0;
+
+  pte = walk(pagetable, va, 0);
+
+  if (pte == 0 || (*pte & PTE_V) == 0 ||
+      (*pte & PTE_U) == 0 || (*pte & PTE_COW) == 0)
+    return 0;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  // Only this process uses the page.
+  if (krefcount(pa) == 1) {
+    *pte = PA2PTE(pa) | ((flags | PTE_W) & ~PTE_COW);
+    sfence_vma();
+    return pa;
+  }
+
+  // Other processes still share the page.
+  mem = (uint64)kalloc();
+
+  if (mem == 0)
+    return 0;
+
+  memmove((void *)mem, (void *)pa, PGSIZE);
+  myproc()->cow_copies++;
+
+  flags = (flags | PTE_W) & ~PTE_COW;
+
+  *pte = PA2PTE(mem) | flags;
+
+  // Release this process's reference to the old page.
+  kfree((void *)pa);
+
+  sfence_vma();
+
+  return mem;
+}
+
 
 int
 ismapped(pagetable_t pagetable, uint64 va)
